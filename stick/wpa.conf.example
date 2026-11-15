@@ -1,0 +1,11 @@
+# Wi-Fi for native mode. Copy to wpa.conf (same folder) and fill in.
+# WPA2-PSK (WPA2 Personal). The SSID is case-sensitive.
+#
+# Instead of the plain password you can put the 64-hex-digit key that
+#   wpa_passphrase "YOUR_SSID"
+# prints, without quotes: psk=0123abcd...
+ctrl_interface=/var/run/wpa_supplicant
+network={
+	ssid="YOUR_SSID"
+	psk="YOUR_PASSWORD"
+}

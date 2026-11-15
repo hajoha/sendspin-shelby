@@ -1,0 +1,47 @@
+#!/bin/sh
+# sendspin-shelby boot hook. install.sh copies this file to /mnt/nv/rc.local.
+#
+# The stock firmware runs /mnt/nv/rc.local synchronously from
+# /etc/init.d/shelby_local (S97), i.e. BEFORE S99SoundTouch starts shepherdd
+# and the vendor audio stack.
+#
+# Kill switch: native mode ONLY if the USB stick holds a file "native-mode".
+# No stick or no flag file => this script does nothing and the speaker boots
+# stock. It must never block for long: everything slow runs in the background.
+
+LOG=/mnt/nv/native-boot.log
+[ -f "$LOG" ] && [ "$(wc -c < "$LOG")" -gt 65536 ] && mv -f "$LOG" "$LOG.old"
+log() { echo "$(cut -d' ' -f1 /proc/uptime) $*" >> "$LOG"; }
+log "rc.local start"
+
+# The stick is mounted asynchronously by udev; wait up to 20 s for it.
+i=0
+while [ $i -lt 20 ] && ! grep -q " /media/sda1 " /proc/mounts; do
+    sleep 1; i=$((i+1))
+done
+
+if [ ! -e /media/sda1/native-mode ]; then
+    log "no /media/sda1/native-mode (waited ${i}s) -> stock boot"
+    exit 0
+fi
+
+log "native-mode flag found -> vendor stack disabled for this boot"
+
+# Replace the vendor start script with a no-op until the next reboot.
+# /etc is read-only; a bind mount only lives in RAM.
+printf '#!/bin/sh\nexit 0\n' > /run/SoundTouch.noop
+chmod 755 /run/SoundTouch.noop
+if mount --bind /run/SoundTouch.noop /etc/init.d/SoundTouch; then
+    log "bind mount over /etc/init.d/SoundTouch ok"
+else
+    log "bind mount FAILED -> stock boot"
+    exit 0
+fi
+
+if [ -r /media/sda1/native/start.sh ]; then
+    nohup sh /media/sda1/native/start.sh > /dev/null 2>&1 &
+    log "started /media/sda1/native/start.sh"
+else
+    log "no /media/sda1/native/start.sh"
+fi
+exit 0

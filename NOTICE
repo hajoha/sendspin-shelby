@@ -1,0 +1,16 @@
+sendspin-shelby
+Copyright 2026 the sendspin-shelby contributors
+
+This project is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The player binary is built from sendspin-go (https://github.com/Sendspin/sendspin-go),
+Copyright the Sendspin authors, licensed under the Apache License, Version 2.0.
+This project adds an output backend (player/shelby.go) and a small patch to its
+main package (player/main-shelby-output.patch).
+
+The release zip contains no files from the speaker's manufacturer. The scripts
+use the codec configuration files that are already present on the speaker.
+
+Trademarks: Bose and SoundTouch are trademarks of Bose Corporation. This
+project is not affiliated with, endorsed by, or sponsored by Bose Corporation.
+The names are used only to describe which hardware the software runs on.

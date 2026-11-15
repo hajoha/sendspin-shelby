@@ -1,0 +1,28 @@
+# sendspin-go player config. Copy to player.yaml (same folder) and adjust.
+# The player writes a generated client_id (and a few other values) back into
+# this file, so keep it on the stick.
+
+# Name shown in Music Assistant.
+name: Living Room Speaker
+
+# Music Assistant is found via mDNS. The player always connects OUT to the
+# server, so the advertised address must be reachable from the speaker. If
+# your server has several networks (VLANs) and the player logs
+# "connection refused" or timeouts, pin the address the speaker can reach:
+# server: 192.168.1.10:8927
+
+port: 8927
+buffer_ms: 250
+# Fixed output-latency compensation in ms (sendspin-go's static delay).
+# Tune by ear against your other sendspin speakers if they are not in sync.
+static_delay_ms: 0
+preferred_codec: pcm
+
+# Required: selects the snd_shelby backend. Do not change.
+audio_device: /dev/snd/snd_shelby
+max_sample_rate: 48000
+
+daemon: true
+no_tui: true
+product_name: sendspin-shelby
+manufacturer: sendspin-shelby

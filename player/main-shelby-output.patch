@@ -1,0 +1,24 @@
+diff --git a/main.go b/main.go
+index 398dc23..a5e54e1 100644
+--- a/main.go
++++ b/main.go
+@@ -259,6 +259,19 @@ func main() {
+ 		}
+ 	}
+ 
++	// SoundTouch 10: write straight to Bose's snd_shelby PCM device (no ALSA).
++	if *audioDevice == "/dev/snd/snd_shelby" {
++		mute := os.Getenv("SENDSPIN_SHELBY_MUTE")
++		if mute == "" {
++			mute = "/sys/class/gpio/gpio72/value"
++		}
++		config.Output = output.NewShelby(*audioDevice, mute)
++		if config.MaxSampleRate == 0 {
++			config.MaxSampleRate = 48000
++		}
++		log.Printf("Using snd_shelby output %s (amp mute gpio %s)", *audioDevice, mute)
++	}
++
+ 	player, err := sendspin.NewPlayer(config)
+ 	if err != nil {
+ 		log.Fatalf("Failed to create player: %v", err)

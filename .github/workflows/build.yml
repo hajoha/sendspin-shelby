@@ -1,0 +1,65 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # The first run cross-compiles the static armv7 musl toolchain (not in
+    # cache.nixos.org); later runs restore /nix/store from the Actions cache.
+    timeout-minutes: 300
+    permissions:
+      contents: write # only used to publish a release on v* tags
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'flake.nix', 'nix/**') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 8G
+
+      - name: Check (backend unit tests, script syntax, full build)
+        run: nix flake check -L
+
+      - name: Build stick bundle
+        run: |
+          nix build .#stick -L
+          mkdir -p dist
+          cp result/*.zip result/SHA256SUMS dist/
+          cat dist/SHA256SUMS
+          unzip -l dist/*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sendspin-shelby-stick
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Tag must match the version in flake.nix
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          want="v$(sed -n 's/^ *version = "\(.*\)";/\1/p' flake.nix | head -1)"
+          echo "tag ${GITHUB_REF_NAME}, flake.nix version ${want}"
+          test "${GITHUB_REF_NAME}" = "${want}"
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
