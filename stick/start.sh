@@ -109,11 +109,17 @@ L="$S/sendspin.log"
         # Optional file native/max_db: level at volume 100 in dB.
         #   dsp: miniDSP volume, default -40, never above -20.
         #   passthrough: software cap, default -24.
+        # native/volume: the last volume, written by the player itself.
         SENDSPIN_SHELBY_MODE=$MODE SENDSPIN_SHELBY_MAX_DB=$(cat "$S/max_db" 2>/dev/null) \
+        SENDSPIN_SHELBY_VOLUME_FILE="$S/volume" \
             nice -n -10 "$S/sendspin-go" --config "$S/player.yaml" >> "$L" 2>&1
         echo "=== $(t) sendspin-go exited rc=$?, restart in 5 s" >> "$L"
         sleep 5
     done
 ) &
 echo "--- $(t) player supervisor started"
+# The stock boot splash (/etc/init.d/rhino-boot-splash) runs the knight-rider
+# LED pattern until the vendor stack kills it. That stack is not running, so
+# end it here; on SIGTERM it exits cleanly and switches all LEDs off.
+kill $(pidof led-splash-write) 2>/dev/null && echo "--- $(t) LED splash stopped"
 sync
