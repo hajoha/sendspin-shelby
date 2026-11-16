@@ -1,5 +1,5 @@
 // ABOUTME: Output backend for the "snd_shelby" PCM device (Bose snd-shelby2 driver)
-// ABOUTME: Writes 48 kHz stereo s32le in exact 4096-byte blocks, no ALSA involved
+// ABOUTME: Writes stereo s32le in exact 4096-byte blocks at the measured DMA rate, no ALSA involved
 package output
 
 // Facts about /dev/snd/snd_shelby (Bose snd-shelby2.ko, kernel 3.14), all
@@ -13,7 +13,12 @@ package output
 //   - Every write() is copied into one 4096-byte DMA buffer WITHOUT a length
 //     check: 512 frames x 2 channels x 32 bit. Writes must be exactly 4096
 //     bytes. A write blocks until the DMA has freed a buffer, so the hardware
-//     clock (48 kHz) paces the caller.
+//     clock paces the caller.
+//   - That clock is NOT 48 kHz: the DMA completes about 91.6 buffers/s, i.e.
+//     about 46.9 kHz (12 MHz / 256 = 46875 Hz fits). Fed 48 kHz, the backlog
+//     grows ~22 ms per second and sendspin-go drops a late chunk about once a
+//     second (an audible click). So the backend measures the real rate from
+//     txDoneCount in /proc/snd_shelby and resamples every stream to it.
 //   - Samples are s32le, left-justified (24-bit value << 8).
 //   - The amp must be powered (gpio75); this backend only toggles mute_out
 //     (gpio72). The codec must already be configured by the start script.
@@ -38,16 +43,46 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	shelbyRate       = 48000
+	// Initial guess for the DMA rate until the meter has measured it.
+	shelbyNominalRate = 46875.0
+	shelbyProcPath    = "/proc/snd_shelby"
+	// The rate estimate is (buffers counted) / (time) since the meter started;
+	// it is used once this much time has passed (error about 1024 Hz / window).
+	shelbyRateMinWindow = 20 * time.Second
+	shelbyRateMin       = 40000.0 // sanity range for a measured rate
+	shelbyRateMax       = 52000.0
+
 	shelbyChannels   = 2
 	shelbyFrames     = 512
 	shelbyBlockBytes = shelbyFrames * shelbyChannels * 4 // 4096
 	shelbyIdleMute   = 3 * time.Second
+
+	// Stream edges. At a new stream (track change, resume) or a stream/clear
+	// (seek) sendspin-go cuts the audio off: its remaining audio is discarded and ~1 s of silence
+	// follows while the new audio buffers. To avoid the hard step, the backend fades
+	// the last frame to zero (at least shelbyFadeFrames, up to
+	// the next block boundary) and writes it out at once; stragglers of the
+	// old stream arriving within shelbyStaleWindow are dropped; the new
+	// stream fades in.
+	//
+	// Adding frames is fine ONLY there, because silence follows anyway.
+	// Mid-stream, never add frames: the driver queue is short and blocking,
+	// so extra audio delays everything behind it, sendspin-go drops chunks
+	// that are >50 ms late, and the gaps cascade (tried: a 45 ms lead-in
+	// after every gap gave ~700 drops per minute).
+	shelbyFadeFrames  = 256 // ~5.5 ms
+	shelbyStaleWindow = 200 * time.Millisecond
+
+	// DSP volume changes ramp in steps instead of jumping (zipper/click).
+	shelbyRampStepDB   = 0.5
+	shelbyRampInterval = 2 * time.Millisecond
+	shelbyRampRangeDB  = 50.0 // ramp from/to maxDB-50; below that, jump
 
 	// SENDSPIN_SHELBY_MAX_DB = level at volume 100, meaning depends on mode.
 	// passthrough: software cap below full scale (full scale is far too loud).
@@ -73,9 +108,16 @@ type Shelby struct {
 	maxDB    float64
 	maxGain  float64 // passthrough: linear gain at volume 100
 
-	codecMu sync.Mutex // guards codec, lastDSP
+	codecMu sync.Mutex // guards codec
 	codec   *os.File
-	lastDSP []byte
+
+	rampMu     sync.Mutex // guards dspTarget, dspSilent, dspCur, dspCurSilent
+	dspTarget  float64
+	dspSilent  bool
+	dspCur     float64 // what the codec holds now
+	dspCurSil  bool
+	rampKick   chan struct{}
+	rampActive bool
 
 	mu        sync.Mutex // guards volume, muted, ampOn, lastWrite
 	volume    int
@@ -83,14 +125,27 @@ type Shelby struct {
 	ampOn     bool
 	lastWrite time.Time
 
+	procPath string     // txDoneCount source; empty = never measure
+	rateMu   sync.Mutex // guards rate
+	rate     float64    // DMA rate in Hz (measured, or the nominal guess)
+
+	// writeMu serialises everything that touches the device stream: Write,
+	// Open/Close at stream boundaries and the edge flusher.
+	writeMu  sync.Mutex
 	f        *os.File
 	inRate   int
 	inCh     int
 	block    []byte
 	fill     int
-	res      *linearResampler
+	res      *cubicResampler
 	frameBuf []int32
 	stopIdle chan struct{}
+	fadePos  int       // fade-in progress in frames (>= shelbyFadeFrames: done)
+	curGain  float64   // passthrough: smoothed software gain
+	lastL    int32     // last frame put into block
+	lastR    int32     //
+	staleEnd time.Time // drop writes until then (old stream after a boundary)
+	stale    int       // frames dropped in the current window (for the log)
 }
 
 // NewShelby returns an Output writing to devPath (normally /dev/snd/snd_shelby).
@@ -115,9 +170,19 @@ func NewShelby(devPath, mutePath string) Output {
 		maxDB:    maxDB,
 		maxGain:  1,
 		volume:   100,
+		procPath: shelbyProcPath,
+		rate:     shelbyNominalRate,
+		fadePos:  0,  // the first stream fades in
+		curGain:  -1, // unset: start at the target gain
+		// normal.cfg loads with the volume coefficient at 0 (silent).
+		dspCur:    maxDB - shelbyRampRangeDB,
+		dspCurSil: true,
+		rampKick:  make(chan struct{}, 1),
 	}
 	if !dspMode {
 		s.maxGain = math.Pow(10, maxDB/20)
+	} else {
+		go s.dspRamper()
 	}
 	return s
 }
@@ -126,6 +191,8 @@ func (s *Shelby) Open(sampleRate, channels, bitDepth int) error {
 	if channels != 1 && channels != 2 {
 		return fmt.Errorf("snd_shelby: unsupported channel count %d", channels)
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if s.f == nil {
 		// O_RDWR on purpose, see the package comment above. Never O_WRONLY.
 		f, err := os.OpenFile(s.devPath, os.O_RDWR, 0)
@@ -136,26 +203,44 @@ func (s *Shelby) Open(sampleRate, channels, bitDepth int) error {
 		s.block = make([]byte, shelbyBlockBytes)
 		s.stopIdle = make(chan struct{})
 		go s.idleMuter(s.stopIdle)
+		if s.procPath != "" {
+			go s.rateMeter(s.stopIdle)
+		}
+	} else {
+		s.boundaryLocked() // a new stream
 	}
 	s.inRate, s.inCh = sampleRate, channels
 	s.res = nil
-	if sampleRate != shelbyRate {
-		s.res = newLinearResampler(sampleRate, shelbyRate)
+	rate := s.dmaRate()
+	if float64(sampleRate) != rate {
+		s.res = newCubicResampler(sampleRate, rate)
 	}
 	mode := "passthrough (software volume)"
 	if s.dspMode {
 		mode = "dsp (Bose normal.cfg volume coefficients)"
 	}
-	log.Printf("snd_shelby: stream %d Hz / %d ch / %d bit -> 48000 Hz / 2 ch / s32le (resample: %v, mode %s, volume 100 = %.1f dB)",
-		sampleRate, channels, bitDepth, s.res != nil, mode, s.maxDB)
+	log.Printf("snd_shelby: stream %d Hz / %d ch / %d bit -> %.1f Hz DMA / 2 ch / s32le (resample: %v, mode %s, volume 100 = %.1f dB)",
+		sampleRate, channels, bitDepth, rate, s.res != nil, mode, s.maxDB)
 	s.applyDSPVolume()
 	return nil
 }
 
 // Write takes interleaved samples in the int32 24-bit range.
 func (s *Shelby) Write(samples []int32) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if s.f == nil {
 		return fmt.Errorf("snd_shelby: output not open")
+	}
+	if !s.staleEnd.IsZero() {
+		if time.Now().Before(s.staleEnd) {
+			s.stale += len(samples) / s.inCh
+			return nil
+		}
+		if s.stale > 0 {
+			log.Printf("snd_shelby: dropped %d frames of the previous stream", s.stale)
+		}
+		s.staleEnd = time.Time{}
 	}
 	s.mu.Lock()
 	vol, muted := s.volume, s.muted
@@ -167,33 +252,59 @@ func (s *Shelby) Write(samples []int32) error {
 	}
 
 	// passthrough: Sendspin's perceptual volume curve times the level cap
-	// (<= 1, so a 24-bit sample can never leave the 24-bit range).
-	// dsp: samples go out unscaled, the miniDSP applies the volume.
-	gain := 1.0
+	// (<= 1, so a 24-bit sample can never leave the 24-bit range), smoothed
+	// per frame so volume changes do not step. dsp: samples go out
+	// unscaled, the miniDSP applies (and ramps) the volume.
+	target := 1.0
 	if !s.dspMode {
-		gain = getVolumeMultiplier(vol, muted) * s.maxGain
-	} else if muted {
-		gain = 0
+		target = getVolumeMultiplier(vol, muted) * s.maxGain
+	}
+	if s.curGain < 0 {
+		s.curGain = target
 	}
 
 	// To stereo frames (frameBuf is reused; the resampler has its own buffer).
 	stereo := s.frameBuf[:0]
-	if s.inCh == 1 {
-		for _, v := range samples {
-			g := int32(float64(v) * gain)
-			stereo = append(stereo, g, g)
+	step := s.inCh
+	for i := 0; i+step <= len(samples); i += step {
+		if s.curGain != target {
+			s.curGain += (target - s.curGain) / 480 // ~10 ms time constant
+			if math.Abs(target-s.curGain) < 1e-6 {
+				s.curGain = target
+			}
 		}
-	} else {
-		for _, v := range samples {
-			stereo = append(stereo, int32(float64(v)*gain))
+		l := int32(float64(samples[i]) * s.curGain)
+		r := l
+		if step == 2 {
+			r = int32(float64(samples[i+1]) * s.curGain)
 		}
+		stereo = append(stereo, l, r)
 	}
 	s.frameBuf = stereo[:0]
 	frames := stereo
-	if s.res != nil {
+	if rate := s.dmaRate(); s.res != nil || float64(s.inRate) != rate {
+		if s.res == nil {
+			s.res = newCubicResampler(s.inRate, rate)
+		}
+		s.res.setRates(s.inRate, rate)
 		frames = s.res.process(stereo)
 	}
+	if len(frames) == 0 {
+		return nil
+	}
 
+	for i := 0; s.fadePos < shelbyFadeFrames && i+1 < len(frames); i += 2 {
+		g := float64(s.fadePos) / shelbyFadeFrames
+		frames[i] = int32(float64(frames[i]) * g)
+		frames[i+1] = int32(float64(frames[i+1]) * g)
+		s.fadePos++
+	}
+	return s.packLocked(frames)
+}
+
+// packLocked appends stereo frames to the block and writes every full block.
+// The caller holds writeMu.
+func (s *Shelby) packLocked(frames []int32) error {
 	for _, v := range frames {
 		u := uint32(v << 8) // 24-bit -> left-justified 32-bit
 		b := s.block[s.fill : s.fill+4]
@@ -210,23 +321,72 @@ func (s *Shelby) Write(samples []int32) error {
 			}
 		}
 	}
+	if n := len(frames); n >= 2 {
+		s.lastL, s.lastR = frames[n-2], frames[n-1]
+	}
 	return nil
 }
 
-func (s *Shelby) Close() error {
+// StreamBoundary is called (via the main patch) when sendspin-go has just
+// cut the audio off without a new stream, i.e. a stream/clear on seek.
+func (s *Shelby) StreamBoundary() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.f != nil {
+		s.boundaryLocked()
+	}
+}
+
+// boundaryLocked ends the current audio with a fade, ignores stragglers of
+// it for shelbyStaleWindow and makes the next audio fade in. The caller
+// holds writeMu.
+func (s *Shelby) boundaryLocked() {
+	if err := s.fadeOutLocked(); err != nil {
+		log.Printf("snd_shelby: %v", err)
+	}
+	s.staleEnd, s.stale = time.Now().Add(shelbyStaleWindow), 0
+	s.fadePos = 0
+}
+
+// fadeOutLocked ramps the last frame down to zero over at least
+// shelbyFadeFrames, up to a block boundary, and writes it, so the output
+// ends at silence instead of stepping there. It ADDS frames: use it only
+// where silence follows (stream boundary, close). The caller holds writeMu.
+func (s *Shelby) fadeOutLocked() error {
 	if s.f == nil {
 		return nil
+	}
+	n := shelbyFrames - s.fill/8
+	if n < shelbyFadeFrames {
+		n += shelbyFrames
+	}
+	ramp := make([]int32, 0, 2*n)
+	for i := 1; i <= n; i++ {
+		g := 1 - float64(i)/float64(n)
+		ramp = append(ramp, int32(float64(s.lastL)*g), int32(float64(s.lastR)*g))
+	}
+	return s.packLocked(ramp)
+}
+
+func (s *Shelby) Close() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.f == nil {
+		return nil
+	}
+	if err := s.fadeOutLocked(); err != nil {
+		log.Printf("snd_shelby: %v", err)
 	}
 	close(s.stopIdle)
 	s.setAmp(false)
 	err := s.f.Close()
 	s.f = nil
 	s.fill = 0
+	s.fadePos = 0
 	s.codecMu.Lock()
 	if s.codec != nil {
 		s.codec.Close()
 		s.codec = nil
-		s.lastDSP = nil
 	}
 	s.codecMu.Unlock()
 	return err
@@ -284,8 +444,8 @@ func dspVolumeBlock(db float64, silent bool) []byte {
 	return b
 }
 
-// applyDSPVolume writes the current volume into both adaptive coefficient
-// buffers of the codec, like APServer: write, flip (SEEK_END), write.
+// applyDSPVolume sets the ramp target from the current volume/mute state;
+// dspRamper moves the codec there step by step.
 func (s *Shelby) applyDSPVolume() {
 	if !s.dspMode {
 		return
@@ -295,40 +455,117 @@ func (s *Shelby) applyDSPVolume() {
 	s.mu.Unlock()
 	silent := muted || vol <= 0
 	db := dspVolumeDB(vol, muted, s.maxDB)
-	block := dspVolumeBlock(db, silent)
 
+	s.rampMu.Lock()
+	changed := s.dspTarget != db || s.dspSilent != silent
+	s.dspTarget, s.dspSilent = db, silent
+	s.rampMu.Unlock()
+	if changed {
+		log.Printf("snd_shelby: volume %d%s -> DSP %.1f dB", vol, map[bool]string{true: " (muted)"}[muted], db)
+	}
+	select {
+	case s.rampKick <- struct{}{}:
+	default:
+	}
+}
+
+// rampNext returns the next coefficient state on the way from (cur,
+// curSilent) to (target, silent), and whether that is the end state. Changes
+// above floor move in shelbyRampStepDB steps; below floor they jump (too
+// quiet to click). Silence is entered and left at the floor.
+func rampNext(cur float64, curSilent bool, target float64, silent bool, floor float64) (float64, bool, bool) {
+	goal := target
+	if silent {
+		goal = floor
+	}
+	if curSilent {
+		if silent {
+			return cur, true, true
+		}
+		if goal <= floor {
+			return goal, false, true
+		}
+		return floor, false, false
+	}
+	if cur <= floor && goal <= floor {
+		cur = goal
+	} else {
+		rt := math.Max(goal, floor) // ramp target, never below the floor
+		switch {
+		case cur < floor:
+			cur = floor
+		case math.Abs(rt-cur) <= shelbyRampStepDB:
+			cur = rt
+		case rt > cur:
+			cur += shelbyRampStepDB
+		default:
+			cur -= shelbyRampStepDB
+		}
+		if cur == rt && goal < floor {
+			cur = goal
+		}
+	}
+	if cur != goal {
+		return cur, false, false
+	}
+	return cur, silent, true
+}
+
+func (s *Shelby) dspRamper() {
+	floor := s.maxDB - shelbyRampRangeDB
+	for range s.rampKick {
+		for {
+			s.rampMu.Lock()
+			cur, curSil, target, silent := s.dspCur, s.dspCurSil, s.dspTarget, s.dspSilent
+			s.rampMu.Unlock()
+			next, nextSil, done := rampNext(cur, curSil, target, silent, floor)
+			if next != cur || nextSil != curSil {
+				if !s.writeDSP(dspVolumeBlock(next, nextSil)) {
+					break
+				}
+				s.rampMu.Lock()
+				s.dspCur, s.dspCurSil = next, nextSil
+				s.rampMu.Unlock()
+			}
+			if done {
+				break
+			}
+			time.Sleep(shelbyRampInterval)
+		}
+	}
+}
+
+// writeDSP writes a coefficient block into both adaptive buffers of the
+// codec, like APServer: write, flip (SEEK_END), write.
+func (s *Shelby) writeDSP(block []byte) bool {
 	s.codecMu.Lock()
 	defer s.codecMu.Unlock()
-	if s.lastDSP != nil && string(s.lastDSP) == string(block) {
-		return
-	}
 	if s.codec == nil {
 		f, err := os.OpenFile(shelbyCodecDev, os.O_RDWR, 0)
 		if err != nil {
 			log.Printf("snd_shelby: open %s: %v", shelbyCodecDev, err)
-			return
+			return false
 		}
 		s.codec = f
 	}
 	for pass := 0; pass < 2; pass++ {
 		if _, err := s.codec.Seek(shelbyCoeffOffset, 0); err != nil {
 			log.Printf("snd_shelby: codec seek: %v", err)
-			return
+			return false
 		}
 		if n, err := s.codec.Write(block); err != nil || n != len(block) {
 			log.Printf("snd_shelby: codec write: n=%d err=%v", n, err)
-			return
+			return false
 		}
 		if pass == 0 {
 			// SEEK_END makes the driver flip the miniDSP's adaptive buffers.
 			if _, err := s.codec.Seek(0, 2); err != nil {
 				log.Printf("snd_shelby: codec buffer flip: %v", err)
-				return
+				return false
 			}
 		}
 	}
-	s.lastDSP = block
-	log.Printf("snd_shelby: volume %d%s -> DSP %.1f dB", vol, map[bool]string{true: " (muted)"}[muted], db)
+	return true
 }
 
 // idleMuter mutes the amp when no audio has been written for a while, so
@@ -367,45 +604,139 @@ func (s *Shelby) setAmp(on bool) {
 	}
 }
 
-// linearResampler converts interleaved stereo int32 between sample rates.
-// Unlike audio.Resampler it carries the previous frame and the fractional
-// read position across calls, so no frames are lost or duplicated at chunk
-// boundaries and the output duration is exact (needed for sync).
-type linearResampler struct {
-	step   float64 // input frames per output frame
-	pos    float64 // read position; 0 = prev frame, k = k-th frame of this chunk
-	prevL  int32
-	prevR  int32
+// dmaRate returns the current estimate of the DMA sample rate in Hz.
+func (s *Shelby) dmaRate() float64 {
+	s.rateMu.Lock()
+	defer s.rateMu.Unlock()
+	return s.rate
+}
+
+// readTxDone returns txDoneCount from /proc/snd_shelby (DMA buffers played,
+// silence included; it counts continuously from boot).
+func readTxDone(path string) (int64, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "txDoneCount:"); ok {
+			return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		}
+	}
+	return 0, fmt.Errorf("no txDoneCount in %s", path)
+}
+
+// rateMeter measures the DMA rate as buffers counted over elapsed time since
+// it started, so the estimate keeps getting more precise. The DMA runs
+// whether or not anything is written, so playback does not disturb it.
+func (s *Shelby) rateMeter(stop <-chan struct{}) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	var t0 time.Time
+	var n0 int64
+	var lastLog time.Time
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		n, err := readTxDone(s.procPath)
+		now := time.Now()
+		if err != nil {
+			if lastLog.IsZero() {
+				log.Printf("snd_shelby: rate meter: %v (keeping %.1f Hz)", err, s.dmaRate())
+				lastLog = now
+			}
+			continue
+		}
+		if t0.IsZero() {
+			t0, n0 = now, n
+			continue
+		}
+		dt := now.Sub(t0)
+		if dt < shelbyRateMinWindow {
+			continue
+		}
+		r, ok := estimateRate(n-n0, dt)
+		if !ok {
+			log.Printf("snd_shelby: rate meter: implausible %.1f Hz, restarting the measurement", r)
+			t0, n0 = now, n
+			continue
+		}
+		s.rateMu.Lock()
+		s.rate = r
+		s.rateMu.Unlock()
+		if lastLog.IsZero() || now.Sub(lastLog) >= 10*time.Minute {
+			log.Printf("snd_shelby: DMA rate %.2f Hz (measured over %.0f s)", r, dt.Seconds())
+			lastLog = now
+		}
+	}
+}
+
+// estimateRate turns a buffer count over a time span into Hz.
+func estimateRate(buffers int64, dt time.Duration) (float64, bool) {
+	r := float64(buffers) * shelbyFrames / dt.Seconds()
+	return r, r >= shelbyRateMin && r <= shelbyRateMax
+}
+
+// cubicResampler converts interleaved stereo int32 between sample rates with
+// 4-point Catmull-Rom interpolation. It carries the last three input frames
+// and the fractional read position across calls, so no frames are lost or
+// duplicated at chunk boundaries and the output duration is exact (needed
+// for sync). The ratio can change between calls (rate meter updates).
+type cubicResampler struct {
+	step   float64  // input frames per output frame
+	pos    float64  // read position in work frames; 1 = first "x0"
+	hist   [6]int32 // last 3 input frames, interleaved
+	work   []int32
 	output []int32
 }
 
-func newLinearResampler(inRate, outRate int) *linearResampler {
-	return &linearResampler{step: float64(inRate) / float64(outRate)}
+func newCubicResampler(inRate int, outRate float64) *cubicResampler {
+	r := &cubicResampler{pos: 1}
+	r.setRates(inRate, outRate)
+	return r
 }
 
-func (r *linearResampler) process(in []int32) []int32 {
-	n := len(in) / 2
-	out := r.output[:0]
-	at := func(k int) (int32, int32) { // k = 0 is prev, k >= 1 is in[k-1]
-		if k == 0 {
-			return r.prevL, r.prevR
-		}
-		return in[2*(k-1)], in[2*(k-1)+1]
+func (r *cubicResampler) setRates(inRate int, outRate float64) {
+	r.step = float64(inRate) / outRate
+}
+
+func clamp24(v float64) int32 {
+	if v > 0x7fffff {
+		return 0x7fffff
 	}
-	for r.pos < float64(n) {
+	if v < -0x800000 {
+		return -0x800000
+	}
+	return int32(math.Round(v))
+}
+
+func (r *cubicResampler) process(in []int32) []int32 {
+	n := len(in) / 2
+	w := append(r.work[:0], r.hist[:]...)
+	w = append(w, in[:2*n]...)
+	last := n + 2 // index of the last work frame
+	out := r.output[:0]
+	for {
 		k := int(r.pos)
-		frac := r.pos - float64(k)
-		l0, r0 := at(k)
-		l1, r1 := at(k + 1)
-		out = append(out,
-			int32(float64(l0)+(float64(l1)-float64(l0))*frac),
-			int32(float64(r0)+(float64(r1)-float64(r0))*frac))
+		if k+2 > last {
+			break
+		}
+		t := r.pos - float64(k)
+		for c := 0; c < 2; c++ {
+			xm := float64(w[2*(k-1)+c])
+			x0 := float64(w[2*k+c])
+			x1 := float64(w[2*(k+1)+c])
+			x2 := float64(w[2*(k+2)+c])
+			y := x0 + 0.5*t*(x1-xm+t*(2*xm-5*x0+4*x1-x2+t*(3*(x0-x1)+x2-xm)))
+			out = append(out, clamp24(y))
+		}
 		r.pos += r.step
 	}
 	r.pos -= float64(n)
-	if n > 0 {
-		r.prevL, r.prevR = in[2*(n-1)], in[2*(n-1)+1]
-	}
-	r.output = out
+	copy(r.hist[:], w[2*n:2*n+6])
+	r.work, r.output = w, out
 	return out
 }
