@@ -1,8 +1,8 @@
 diff --git a/main.go b/main.go
-index 398dc23..a5e54e1 100644
+index 9bb2d98..f1f2f4c 100644
 --- a/main.go
 +++ b/main.go
-@@ -259,6 +259,19 @@ func main() {
+@@ -259,6 +259,22 @@ func main() {
  		}
  	}
  
@@ -17,8 +17,193 @@ index 398dc23..a5e54e1 100644
 +			config.MaxSampleRate = 48000
 +		}
 +		log.Printf("Using snd_shelby output %s (amp mute gpio %s)", *audioDevice, mute)
++		if vf := os.Getenv("SENDSPIN_SHELBY_VOLUME_FILE"); vf != "" {
++			persistVolume(&config, vf)
++		}
 +	}
 +
  	player, err := sendspin.NewPlayer(config)
  	if err != nil {
  		log.Fatalf("Failed to create player: %v", err)
+diff --git a/pkg/sendspin/player.go b/pkg/sendspin/player.go
+index 07f6f1f..0dd383e 100644
+--- a/pkg/sendspin/player.go
++++ b/pkg/sendspin/player.go
+@@ -212,6 +212,10 @@ func (p *Player) Connect() error {
+ 	p.state.Connected = true
+ 	p.stateMu.Unlock()
+ 
++	// The handshake announces volume 100; correct it to the real state.
++	if err := p.sendState(); err != nil {
++		log.Printf("Failed to send initial state: %v", err)
++	}
+ 	p.notifyStateChange()
+ 
+ 	go p.consumeAudio(recv)
+@@ -240,6 +244,7 @@ func (p *Player) buildReceiver(addr string) (*Receiver, error) {
+ 		OnMetadata:     p.config.OnMetadata,
+ 		OnStreamStart:  p.onStreamStart,
+ 		OnStreamEnd:    p.onStreamEnd,
++		OnStreamClear:  p.onStreamClear,
+ 		OnError:        p.config.OnError,
+ 		OnCommand: func(cmd protocol.PlayerCommand) {
+ 			switch cmd.Command {
+@@ -330,6 +335,10 @@ func (p *Player) runReconnectLoop(initial *Receiver) {
+ 		p.state.Connected = true
+ 		p.stateMu.Unlock()
+ 
++		// The handshake announces volume 100; correct it to the real state.
++		if err := p.sendState(); err != nil {
++			log.Printf("Failed to send state after reconnect: %v", err)
++		}
+ 		p.notifyStateChange()
+ 
+ 		go p.consumeAudio(current)
+@@ -423,6 +432,17 @@ func (p *Player) onStreamStart(format audio.Format) {
+ 	p.notifyStateChange()
+ }
+ 
++// onStreamClear tells an output that can smooth stream edges that the
++// audio was just cut off (seek), so it can fade out instead of stepping.
++func (p *Player) onStreamClear() {
++	p.stateMu.Lock()
++	o := p.output
++	p.stateMu.Unlock()
++	if b, ok := o.(interface{ StreamBoundary() }); ok {
++		b.StreamBoundary()
++	}
++}
++
+ func (p *Player) onStreamEnd() {
+ 	p.stateMu.Lock()
+ 	p.state.State = "idle"
+diff --git a/pkg/sendspin/receiver.go b/pkg/sendspin/receiver.go
+index 3143860..c47f638 100644
+--- a/pkg/sendspin/receiver.go
++++ b/pkg/sendspin/receiver.go
+@@ -48,8 +48,10 @@ type ReceiverConfig struct {
+ 	OnMetadata     func(Metadata)
+ 	OnStreamStart  func(audio.Format)
+ 	OnStreamEnd    func()
+-	OnError        func(error)
+-	OnCommand      func(protocol.PlayerCommand)
++	// OnStreamClear runs after a stream/clear (seek) emptied the buffers.
++	OnStreamClear func()
++	OnError       func(error)
++	OnCommand     func(protocol.PlayerCommand)
+ }
+ 
+ type ReceiverStats struct {
+@@ -190,11 +192,6 @@ func (r *Receiver) Connect() error {
+ 			BufferCapacity:    r.config.BufferCapacity,
+ 			SupportedCommands: []string{"volume", "mute"},
+ 		},
+-		ArtworkV1Support: &protocol.ArtworkV1Support{
+-			Channels: []protocol.ArtworkChannel{
+-				{Source: "album", Format: "jpeg", MediaWidth: 600, MediaHeight: 600},
+-			},
+-		},
+ 	}
+ 
+ 	r.client = protocol.NewClient(clientConfig)
+@@ -203,6 +200,19 @@ func (r *Receiver) Connect() error {
+ 		return fmt.Errorf("connection failed: %w", err)
+ 	}
+ 
++	// Nothing consumes artwork. Drain it anyway: a full ArtworkChunks channel
++	// (capacity 10) blocks the websocket reader, and with it audio, clock
++	// sync and commands, until the connection is torn down.
++	go func(c *protocol.Client) {
++		for {
++			select {
++			case <-c.ArtworkChunks:
++			case <-r.ctx.Done():
++				return
++			}
++		}
++	}(r.client)
++
+ 	if r.config.OnCommand != nil {
+ 		go func() {
+ 			for {
+@@ -385,6 +395,9 @@ func (r *Receiver) handleStreamClear() {
+ 				if sched := r.currentScheduler(); sched != nil {
+ 					sched.Clear()
+ 				}
++				if r.config.OnStreamClear != nil {
++					r.config.OnStreamClear()
++				}
+ 			}
+ 		case <-r.ctx.Done():
+ 			return
+diff --git a/shelby_volume.go b/shelby_volume.go
+new file mode 100644
+index 0000000..0d7a927
+--- /dev/null
++++ b/shelby_volume.go
+@@ -0,0 +1,65 @@
++// ABOUTME: Keeps the player volume across restarts in a small file (snd_shelby builds)
++// ABOUTME: Upstream starts every process at volume 100 and reports that to the server
++package main
++
++import (
++	"log"
++	"os"
++	"strconv"
++	"strings"
++	gosync "sync"
++	"time"
++
++	"github.com/Sendspin/sendspin-go/pkg/sendspin"
++)
++
++// persistVolume sets the initial volume from path (if it holds 0..100) and
++// wraps OnStateChange so later volume changes are written back, 3 s after
++// the last change (the file lives on a USB stick).
++func persistVolume(config *sendspin.PlayerConfig, path string) {
++	saved := config.Volume
++	if b, err := os.ReadFile(path); err == nil {
++		if v, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && v >= 0 && v <= 100 {
++			if v == 0 {
++				v = 1 // NewPlayer treats 0 as "unset" and would start at 100
++			}
++			config.Volume, saved = v, v
++			log.Printf("Volume %d restored from %s", v, path)
++		}
++	}
++
++	var mu gosync.Mutex
++	var timer *time.Timer
++	pending := saved
++	write := func() {
++		mu.Lock()
++		v := pending
++		mu.Unlock()
++		tmp := path + ".tmp"
++		if err := os.WriteFile(tmp, []byte(strconv.Itoa(v)+"\n"), 0o644); err != nil {
++			log.Printf("Volume: save %s: %v", path, err)
++			return
++		}
++		if err := os.Rename(tmp, path); err != nil {
++			log.Printf("Volume: save %s: %v", path, err)
++		}
++	}
++
++	prev := config.OnStateChange
++	config.OnStateChange = func(state sendspin.PlayerState) {
++		if prev != nil {
++			prev(state)
++		}
++		mu.Lock()
++		defer mu.Unlock()
++		if state.Volume == pending || state.Volume < 0 || state.Volume > 100 {
++			return
++		}
++		pending = state.Volume
++		if timer == nil {
++			timer = time.AfterFunc(3*time.Second, write)
++		} else {
++			timer.Reset(3 * time.Second)
++		}
++	}
++}

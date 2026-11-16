@@ -74,6 +74,7 @@ All files live in `native/` on the stick.
 | `hostname` | Optional DHCP hostname (default `sendspin-shelby`). |
 | `max_db` | Optional loudness at volume 100 %, in dB. `dsp` mode: default `-40`, never above `-20`. `passthrough` mode: default `-24`. |
 | `codec_mode` | Optional. `dsp` (default) uses the speaker's own sound tuning; `passthrough` uses an untuned codec path with software volume. |
+| `volume` | Written by the player: the last volume (0–100), restored after a restart. |
 
 After editing `player.yaml`, `max_db` or `codec_mode`, restart the player with `killall sendspin-go`
 (it restarts after 5 s). For `codec_mode`, reboot instead.
@@ -97,19 +98,39 @@ Logs on the stick, readable on any computer: `native/log.txt` (boot), `native/wp
   address* above, and that port 8927 is open on the server.
 - **No Wi-Fi in native mode:** the speaker falls back to stock after 90 s. Check the SSID spelling
   (case-sensitive) and `wpa.log`.
-- **Silence, but the player is connected:** `diag.sh` should show about 93 DMA buffers/s. If it shows
-  0, reboot (see *How it works*).
+- **Silence, but the player is connected:** `diag.sh` should show about 91–92 DMA buffers/s. If it
+  shows 0, reboot (see *How it works*).
 
 ## How it works
 
 - **Boot hook.** The stock init runs `/mnt/nv/rc.local` (on the writable flash partition) at `S97`,
   before the vendor stack starts at `S99`. If the stick holds `native-mode`, the hook bind-mounts a
   no-op over `/etc/init.d/SoundTouch` (in RAM only) and starts `native/start.sh`. That script brings
-  up Wi-Fi itself, configures the codec and runs the player in a restart loop.
+  up Wi-Fi itself, configures the codec and runs the player in a restart loop. It also stops the
+  stock boot LED animation (normally the vendor stack does that), so the LEDs are off.
 - **PCM device.** `/dev/snd/snd_shelby` takes 48 kHz stereo s32le, left-justified, in writes of
   **exactly 4096 bytes** (512 frames). The driver copies each write into a DMA buffer without a
   length check. It must be opened **`O_RDWR`**: a write-only open runs the driver's TX reset path,
   after which DMA stays stopped until the next reboot. The hardware clock paces the writes.
+- **No queue in the driver.** It has just two DMA buffers (ping/pong). `write()` waits for the next
+  buffer-done interrupt and fills the buffer that is not playing. If no write arrives before the
+  following interrupt, the driver counts `txUnderflows` and plays silence, an audible click. So every
+  block has to arrive within one block period (10.9 ms). The backend writes from a native C thread at
+  real-time priority (`SCHED_FIFO` 20, `SENDSPIN_SHELBY_RT_PRIO`), fed by a small block ring. It runs
+  outside the Go runtime on purpose: a Go thread has to get a scheduler slot back after every write,
+  and on this single-core CPU that was measured to take up to 1.9 s (garbage collection). Once a minute it logs
+  `snd_shelby: dma stats ...` (underflows, writer starvation, ring fill).
+- **Sample rate.** That clock is **not 48 kHz**: the DMA completes about 91.6 buffers/s, about
+  46.9 kHz (12 MHz / 256 = 46,875 Hz fits). Fed 48 kHz, playback falls behind ~22 ms per second and
+  sendspin-go drops a late chunk about once a second, which you hear as a click. The backend measures
+  the real rate from `txDoneCount` in `/proc/snd_shelby` (logged as `snd_shelby: DMA rate ...`) and
+  resamples every stream to it with cubic interpolation.
+- **No hard edges.** Volume changes ramp the DSP coefficient in 0.5 dB steps instead of jumping.
+  At a new stream (track change, resume) sendspin-go cuts the old one off, and about 1 s of silence
+  follows. The backend fades the old stream's last frame to zero right away, drops its stragglers and
+  fades the new one in. Frames are only added there, where silence follows anyway: mid-stream, extra
+  audio would delay everything behind it in the short, blocking driver queue, and sendspin-go would
+  drop late chunks.
 - **Sound tuning and volume.** In `dsp` mode the codec runs the vendor's DSP program
   (`rhino_sm2_normal.cfg`, already on the speaker). It loads with the volume coefficient at 0, i.e.
   silent. Like the vendor firmware, the backend writes the volume as 8 coefficients to page 44,
@@ -119,6 +140,11 @@ Logs on the stick, readable on any computer: `native/log.txt` (boot), `native/wp
 - **Player.** sendspin-go **1.8.2** (1.8.0 ignores the server's volume commands) plus
   [`player/shelby.go`](player/shelby.go), cross-compiled as a fully static armv7 musl binary so it
   doesn't depend on the speaker's 2017 userland.
+  [`player/main-shelby-output.patch`](player/main-shelby-output.patch) also fixes three upstream bugs:
+  - The player no longer advertises album artwork. Nothing read the artwork queue, so after about 10
+    tracks the connection's reader blocked and playback stopped for good.
+  - After every connect and reconnect, it reports its real volume instead of 100.
+  - It keeps the volume across restarts in `native/volume`.
 
 ## Building
 
