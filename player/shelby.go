@@ -12,8 +12,16 @@ package output
 //     ("tx" in /proc/snd_shelby is ignored after probe).
 //   - Every write() is copied into one 4096-byte DMA buffer WITHOUT a length
 //     check: 512 frames x 2 channels x 32 bit. Writes must be exactly 4096
-//     bytes. A write blocks until the DMA has freed a buffer, so the hardware
-//     clock paces the caller.
+//     bytes.
+//   - There is no queue, only two DMA buffers (ping/pong; from the
+//     disassembled module). write() waits for the next buffer-done
+//     interrupt, copies into the buffer that is not playing and returns.
+//     The interrupt counts txDoneCount; if no write came since the previous
+//     interrupt it counts txUnderflows and zeroes that buffer. So after each
+//     write the next block must arrive within ONE block period (10.9 ms) or
+//     it is an underflow (an audible click). The backend therefore writes
+//     from a dedicated thread at real-time priority (a native C thread, outside the Go runtime), fed by
+//     a small block ring.
 //   - That clock is NOT 48 kHz: the DMA completes about 91.6 buffers/s, i.e.
 //     about 46.9 kHz (12 MHz / 256 = 46875 Hz fits). Fed 48 kHz, the backlog
 //     grows ~22 ms per second and sendspin-go drops a late chunk about once a
@@ -37,6 +45,171 @@ package output
 //   - "passthrough": codec runs rhino_sm2_passthrough.cfg (no Bose tuning,
 //     fixed DSP level); volume is applied in software with a level cap.
 
+/*
+#cgo LDFLAGS: -lpthread
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+// The device writer, outside the Go runtime: a native thread at SCHED_FIFO
+// that takes full blocks from a ring and write()s them. Go threads need a
+// Go scheduler slot (P) after every syscall; on this single-core speaker
+// that wait was measured at up to 1.9 s (GC), and the driver allows 10.9 ms.
+enum { SHELBY_BLOCK = 4096 };
+
+typedef struct {
+	int fd, nblocks, prio, rt_err;
+	unsigned char *buf;
+	unsigned long head, tail;  // blocks pushed / written; guarded by mu
+	int stop, err;             // err: errno of the first failed write
+	unsigned long starved, wrote;
+	long write_max_ns;
+	pthread_mutex_t mu;
+	pthread_cond_t cv;
+	pthread_t th;
+} shelby_ring;
+
+static long shelby_now_ns(void) {
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1000000000L + t.tv_nsec;
+}
+
+static void *shelby_writer(void *arg) {
+	shelby_ring *r = arg;
+	if (r->prio > 0) {
+		struct sched_param sp = { .sched_priority = r->prio };
+		r->rt_err = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+	}
+	pthread_mutex_lock(&r->mu);
+	for (;;) {
+		if (r->head == r->tail && !r->stop) {
+			r->starved++;
+			while (r->head == r->tail && !r->stop)
+				pthread_cond_wait(&r->cv, &r->mu);
+		}
+		if (r->head == r->tail)
+			break; // stopped and drained
+		unsigned char *b = r->buf + (r->tail % r->nblocks) * SHELBY_BLOCK;
+		int failed = r->err != 0;
+		pthread_mutex_unlock(&r->mu);
+		if (!failed) {
+			long t0 = shelby_now_ns();
+			ssize_t n;
+			do {
+				n = write(r->fd, b, SHELBY_BLOCK);
+			} while (n < 0 && errno == EINTR);
+			long d = shelby_now_ns() - t0;
+			pthread_mutex_lock(&r->mu);
+			// Never retry a failing device at real-time priority: stop
+			// writing, keep draining, report it.
+			if (n != SHELBY_BLOCK)
+				r->err = n < 0 ? errno : EIO;
+			r->wrote++;
+			if (d > r->write_max_ns)
+				r->write_max_ns = d;
+		} else {
+			pthread_mutex_lock(&r->mu);
+		}
+		r->tail++;
+		pthread_cond_broadcast(&r->cv);
+	}
+	pthread_mutex_unlock(&r->mu);
+	return NULL;
+}
+
+static shelby_ring *shelby_ring_start(int fd, int nblocks, int prio) {
+	shelby_ring *r = calloc(1, sizeof *r);
+	if (!r)
+		return NULL;
+	r->buf = malloc((size_t)nblocks * SHELBY_BLOCK);
+	if (!r->buf) {
+		free(r);
+		return NULL;
+	}
+	r->fd = fd;
+	r->nblocks = nblocks;
+	r->prio = prio;
+	pthread_mutex_init(&r->mu, NULL);
+	pthread_cond_init(&r->cv, NULL);
+	if (pthread_create(&r->th, NULL, shelby_writer, r) != 0) {
+		free(r->buf);
+		free(r);
+		return NULL;
+	}
+	return r;
+}
+
+// Copies one block in, waiting while the ring is full. Returns the write
+// errno so far (0 = fine).
+static int shelby_ring_push(shelby_ring *r, const unsigned char *block) {
+	pthread_mutex_lock(&r->mu);
+	while (r->head - r->tail == (unsigned long)r->nblocks && !r->err)
+		pthread_cond_wait(&r->cv, &r->mu);
+	int err = r->err;
+	unsigned long slot = r->head % r->nblocks;
+	pthread_mutex_unlock(&r->mu);
+	if (err)
+		return err;
+	// The writer never touches an unpublished slot: copy without the lock.
+	memcpy(r->buf + slot * SHELBY_BLOCK, block, SHELBY_BLOCK);
+	pthread_mutex_lock(&r->mu);
+	r->head++;
+	pthread_cond_broadcast(&r->cv);
+	pthread_mutex_unlock(&r->mu);
+	return 0;
+}
+
+// Waits until every pushed block has been written (or the device failed).
+static void shelby_ring_drain(shelby_ring *r) {
+	pthread_mutex_lock(&r->mu);
+	while (r->tail != r->head)
+		pthread_cond_wait(&r->cv, &r->mu);
+	pthread_mutex_unlock(&r->mu);
+}
+
+typedef struct {
+	unsigned long starved, wrote, fill;
+	long write_max_ns;
+	int err, rt_err;
+} shelby_stats;
+
+static shelby_stats shelby_ring_stats(shelby_ring *r, int reset) {
+	shelby_stats st;
+	pthread_mutex_lock(&r->mu);
+	st.starved = r->starved;
+	st.wrote = r->wrote;
+	st.fill = r->head - r->tail;
+	st.write_max_ns = r->write_max_ns;
+	st.err = r->err;
+	st.rt_err = r->rt_err;
+	if (reset) {
+		r->starved = r->wrote = 0;
+		r->write_max_ns = 0;
+	}
+	pthread_mutex_unlock(&r->mu);
+	return st;
+}
+
+// Stops the writer after it has written what is queued, and frees the ring.
+static void shelby_ring_stop(shelby_ring *r) {
+	pthread_mutex_lock(&r->mu);
+	r->stop = 1;
+	pthread_cond_broadcast(&r->cv);
+	pthread_mutex_unlock(&r->mu);
+	pthread_join(r->th, NULL);
+	pthread_mutex_destroy(&r->mu);
+	pthread_cond_destroy(&r->cv);
+	free(r->buf);
+	free(r);
+}
+*/
+import "C"
+
 import (
 	"fmt"
 	"log"
@@ -45,7 +218,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -72,12 +247,22 @@ const (
 	// stream fades in.
 	//
 	// Adding frames is fine ONLY there, because silence follows anyway.
-	// Mid-stream, never add frames: the driver queue is short and blocking,
-	// so extra audio delays everything behind it, sendspin-go drops chunks
-	// that are >50 ms late, and the gaps cascade (tried: a 45 ms lead-in
-	// after every gap gave ~700 drops per minute).
+	// Mid-stream, never add frames: playout is paced by the DMA, so extra
+	// audio delays everything behind it, sendspin-go drops chunks that are
+	// >50 ms late, and the gaps cascade (tried: a 45 ms lead-in after every
+	// gap gave ~700 drops per minute; one per stream changed nothing).
 	shelbyFadeFrames  = 256 // ~5.5 ms
 	shelbyStaleWindow = 200 * time.Millisecond
+
+	// Blocks between the packing code and the writer thread (87 ms). Enough
+	// for the jitter of sendspin-go's hand-over (gaps up to ~80 ms seen);
+	// more only adds latency once it fills after a stall.
+	shelbyRingBlocks = 8
+	// SCHED_FIFO priority of the writer thread (SENDSPIN_SHELBY_RT_PRIO,
+	// 0 = normal scheduling).
+	shelbyDefaultRTPrio = 20
+
+	shelbyStatsEvery = time.Minute
 
 	// DSP volume changes ramp in steps instead of jumping (zipper/click).
 	shelbyRampStepDB   = 0.5
@@ -140,13 +325,23 @@ type Shelby struct {
 	res      *cubicResampler
 	frameBuf []int32
 	stopIdle chan struct{}
-	fadePos  int       // fade-in progress in frames (>= shelbyFadeFrames: done)
-	curGain  float64   // passthrough: smoothed software gain
-	lastL    int32     // last frame put into block
-	lastR    int32     //
-	staleEnd time.Time // drop writes until then (old stream after a boundary)
-	stale    int       // frames dropped in the current window (for the log)
+	fadePos  int           // fade-in progress in frames (>= shelbyFadeFrames: done)
+	curGain  float64       // passthrough: smoothed software gain
+	lastL    int32         // last frame put into block
+	lastR    int32         //
+	staleEnd time.Time     // drop writes until then (old stream after a boundary)
+	stale    int           // frames dropped in the current window (for the log)
+	gapMax   time.Duration // longest time between two Write calls (stats)
+	lastCall time.Time
+
+	// The native writer thread and its block ring (see the C preamble).
+	ring   *C.shelby_ring
+	rtPrio int
 }
+
+// dmaCount holds the driver's counters: txDoneCount counts every DMA buffer
+// played, txUnderflows those that were silence because no write came in time.
+type dmaCount struct{ done, under int64 }
 
 // NewShelby returns an Output writing to devPath (normally /dev/snd/snd_shelby).
 // mutePath is the sysfs value file of the amp's mute_out GPIO, or "".
@@ -172,7 +367,8 @@ func NewShelby(devPath, mutePath string) Output {
 		volume:   100,
 		procPath: shelbyProcPath,
 		rate:     shelbyNominalRate,
-		fadePos:  0,  // the first stream fades in
+		fadePos:  0, // the first stream fades in
+		rtPrio:   rtPrioFromEnv(),
 		curGain:  -1, // unset: start at the target gain
 		// normal.cfg loads with the volume coefficient at 0 (silent).
 		dspCur:    maxDB - shelbyRampRangeDB,
@@ -201,10 +397,18 @@ func (s *Shelby) Open(sampleRate, channels, bitDepth int) error {
 		}
 		s.f = f
 		s.block = make([]byte, shelbyBlockBytes)
+		s.ring = C.shelby_ring_start(C.int(f.Fd()), shelbyRingBlocks, C.int(s.rtPrio))
+		if s.ring == nil {
+			f.Close()
+			s.f = nil
+			return fmt.Errorf("snd_shelby: cannot start the writer thread")
+		}
+		go s.logWriterPrio()
 		s.stopIdle = make(chan struct{})
 		go s.idleMuter(s.stopIdle)
 		if s.procPath != "" {
 			go s.rateMeter(s.stopIdle)
+			go s.dmaStats(s.stopIdle, s.ring)
 		}
 	} else {
 		s.boundaryLocked() // a new stream
@@ -231,6 +435,14 @@ func (s *Shelby) Write(samples []int32) error {
 	defer s.writeMu.Unlock()
 	if s.f == nil {
 		return fmt.Errorf("snd_shelby: output not open")
+	}
+	if now := time.Now(); !s.lastCall.IsZero() {
+		if g := now.Sub(s.lastCall); g > s.gapMax {
+			s.gapMax = g
+		}
+		s.lastCall = now
+	} else {
+		s.lastCall = now
 	}
 	if !s.staleEnd.IsZero() {
 		if time.Now().Before(s.staleEnd) {
@@ -302,8 +514,9 @@ func (s *Shelby) Write(samples []int32) error {
 	return s.packLocked(frames)
 }
 
-// packLocked appends stereo frames to the block and writes every full block.
-// The caller holds writeMu.
+// packLocked appends stereo frames to the block and hands every full block
+// to the writer thread (blocking while the ring is full). The caller holds
+// writeMu.
 func (s *Shelby) packLocked(frames []int32) error {
 	for _, v := range frames {
 		u := uint32(v << 8) // 24-bit -> left-justified 32-bit
@@ -311,13 +524,9 @@ func (s *Shelby) packLocked(frames []int32) error {
 		b[0], b[1], b[2], b[3] = byte(u), byte(u>>8), byte(u>>16), byte(u>>24)
 		s.fill += 4
 		if s.fill == shelbyBlockBytes {
-			n, err := s.f.Write(s.block)
 			s.fill = 0
-			if err != nil {
-				return fmt.Errorf("snd_shelby: write: %w", err)
-			}
-			if n != shelbyBlockBytes {
-				return fmt.Errorf("snd_shelby: short write %d of %d", n, shelbyBlockBytes)
+			if e := C.shelby_ring_push(s.ring, (*C.uchar)(unsafe.Pointer(&s.block[0]))); e != 0 {
+				return fmt.Errorf("snd_shelby: write: %w", syscall.Errno(e))
 			}
 		}
 	}
@@ -346,6 +555,45 @@ func (s *Shelby) boundaryLocked() {
 	}
 	s.staleEnd, s.stale = time.Now().Add(shelbyStaleWindow), 0
 	s.fadePos = 0
+	s.lastCall = time.Time{} // the gap before the next stream is not jitter
+}
+
+// logWriterPrio reports once whether the writer got real-time priority.
+func (s *Shelby) logWriterPrio() {
+	time.Sleep(100 * time.Millisecond)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if s.ring == nil || s.rtPrio == 0 {
+		return
+	}
+	if st := C.shelby_ring_stats(s.ring, 0); st.rt_err != 0 {
+		log.Printf("snd_shelby: writer: SCHED_FIFO %d: %v (normal priority)", s.rtPrio, syscall.Errno(st.rt_err))
+	} else {
+		log.Printf("snd_shelby: native writer thread at SCHED_FIFO %d", s.rtPrio)
+	}
+}
+
+// drain waits until the writer has written every block handed over so far.
+func (s *Shelby) drain() {
+	s.writeMu.Lock()
+	r := s.ring
+	s.writeMu.Unlock()
+	if r != nil {
+		C.shelby_ring_drain(r)
+	}
+}
+
+func rtPrioFromEnv() int {
+	v := os.Getenv("SENDSPIN_SHELBY_RT_PRIO")
+	if v == "" {
+		return shelbyDefaultRTPrio
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || n < 0 || n > 99 {
+		log.Printf("snd_shelby: ignoring SENDSPIN_SHELBY_RT_PRIO=%q (want 0..99)", v)
+		return shelbyDefaultRTPrio
+	}
+	return n
 }
 
 // fadeOutLocked ramps the last frame down to zero over at least
@@ -378,6 +626,8 @@ func (s *Shelby) Close() error {
 		log.Printf("snd_shelby: %v", err)
 	}
 	close(s.stopIdle)
+	C.shelby_ring_stop(s.ring)
+	s.ring = nil
 	s.setAmp(false)
 	err := s.f.Close()
 	s.f = nil
@@ -611,19 +861,83 @@ func (s *Shelby) dmaRate() float64 {
 	return s.rate
 }
 
-// readTxDone returns txDoneCount from /proc/snd_shelby (DMA buffers played,
-// silence included; it counts continuously from boot).
-func readTxDone(path string) (int64, error) {
+// readDMACounters reads txDoneCount and txUnderflows from /proc/snd_shelby
+// (both count continuously from boot).
+func readDMACounters(path string) (dmaCount, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return 0, err
+		return dmaCount{}, err
 	}
+	var c dmaCount
+	var haveDone, haveUnder bool
 	for _, line := range strings.Split(string(b), "\n") {
-		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "txDoneCount:"); ok {
-			return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		line = strings.TrimSpace(line)
+		if v, ok := strings.CutPrefix(line, "txDoneCount:"); ok {
+			c.done, err = strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			haveDone = err == nil
+		} else if v, ok := strings.CutPrefix(line, "txUnderflows:"); ok {
+			c.under, err = strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			haveUnder = err == nil
 		}
 	}
-	return 0, fmt.Errorf("no txDoneCount in %s", path)
+	if !haveDone || !haveUnder {
+		return dmaCount{}, fmt.Errorf("no txDoneCount/txUnderflows in %s", path)
+	}
+	return c, nil
+}
+
+// dmaStats logs once a minute: driver underflows, blocks written, how often
+// the writer found the ring empty (producer late), the ring fill range
+// (sampled every 250 ms), the longest write and the longest gap between
+// Write calls.
+func (s *Shelby) dmaStats(stop <-chan struct{}, ring *C.shelby_ring) {
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	last, err := readDMACounters(s.procPath)
+	haveLast := err == nil
+	rMin, rMax := shelbyRingBlocks, 0
+	next := time.Now().Add(shelbyStatsEvery)
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+		}
+		s.writeMu.Lock() // ring is freed by Close under writeMu
+		if s.ring != ring {
+			s.writeMu.Unlock()
+			return
+		}
+		st := C.shelby_ring_stats(ring, 0)
+		s.writeMu.Unlock()
+		if n := int(st.fill); n < rMin {
+			rMin = n
+		} else if n > rMax {
+			rMax = n
+		}
+		if time.Now().Before(next) {
+			continue
+		}
+		next = time.Now().Add(shelbyStatsEvery)
+		c, err := readDMACounters(s.procPath)
+		s.writeMu.Lock()
+		if s.ring != ring {
+			s.writeMu.Unlock()
+			return
+		}
+		st = C.shelby_ring_stats(ring, 1)
+		wrote, starved, wMax := int64(st.wrote), int64(st.starved), time.Duration(st.write_max_ns)
+		gMax := s.gapMax
+		s.gapMax = 0
+		s.writeMu.Unlock()
+		if err == nil && haveLast && wrote > 0 {
+			log.Printf("snd_shelby: dma stats: %d underflows, %d blocks written, writer starved %d times, ring %d..%d blocks, longest write %v, longest gap between Writes %v",
+				c.under-last.under, wrote, starved, rMin, rMax,
+				wMax.Round(10*time.Microsecond), gMax.Round(time.Millisecond))
+		}
+		last, haveLast = c, err == nil
+		rMin, rMax = shelbyRingBlocks, 0
+	}
 }
 
 // rateMeter measures the DMA rate as buffers counted over elapsed time since
@@ -641,7 +955,8 @@ func (s *Shelby) rateMeter(stop <-chan struct{}) {
 			return
 		case <-t.C:
 		}
-		n, err := readTxDone(s.procPath)
+		c, err := readDMACounters(s.procPath)
+		n := c.done
 		now := time.Now()
 		if err != nil {
 			if lastLog.IsZero() {

@@ -60,7 +60,7 @@ buildGoModule (finalAttrs: {
   doCheck = runTests;
   checkFlags = [
     "-run"
-    "Shelby|CubicResampler|DSP|TxDone|EstimateRate|RampNext"
+    "Shelby|CubicResampler|DSP|DMACounters|EstimateRate|RampNext"
   ];
 
   # The speaker has no /nix/store: refuse to produce anything but a static ELF.

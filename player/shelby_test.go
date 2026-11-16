@@ -142,13 +142,13 @@ func TestCubicResamplerClamps(t *testing.T) {
 	}
 }
 
-func TestReadTxDone(t *testing.T) {
+func TestReadDMACounters(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "snd_shelby")
 	proc := "mode: wifi\ngpios: rx:255 tx:255 read:255 write:255\n\ntxDoneCount: 6261782\ntxUnderflows: 5952322\n\nrxDoneCount 0\n"
 	os.WriteFile(p, []byte(proc), 0o600)
-	n, err := readTxDone(p)
-	if err != nil || n != 6261782 {
-		t.Fatalf("got %d, %v", n, err)
+	c, err := readDMACounters(p)
+	if err != nil || c.done != 6261782 || c.under != 5952322 {
+		t.Fatalf("got %+v, %v", c, err)
 	}
 }
 
@@ -237,6 +237,7 @@ func TestShelbyStreamBoundaryFades(t *testing.T) {
 	}
 	s.Write(full(700)) // 512 written, 188 pending
 	s.Open(48000, 2, 24)
+	s.drain()
 	b, _ := os.ReadFile(dev)
 	if len(b)%shelbyBlockBytes != 0 || len(b)/8 < 700+shelbyFadeFrames {
 		t.Fatalf("%d bytes after the boundary, want the fade written out to a block boundary", len(b))
@@ -256,6 +257,7 @@ func TestShelbyStreamBoundaryFades(t *testing.T) {
 	s.Write(full(300)) // straggler of the old stream: dropped
 	s.staleEnd = time.Now()
 	s.Write(full(2 * shelbyFrames)) // the new stream
+	s.drain()
 	b, _ = os.ReadFile(dev)
 	if l, _ := frameAt(b, ended); l != 0 {
 		t.Fatalf("new stream starts at %d, want a fade-in from 0", l)
@@ -278,6 +280,7 @@ func TestShelbyStreamBoundaryOnSeek(t *testing.T) {
 	}
 	s.Write(in)
 	s.StreamBoundary()
+	s.drain()
 	b, _ := os.ReadFile(dev)
 	if len(b)%shelbyBlockBytes != 0 || len(b)/8 < 700+shelbyFadeFrames {
 		t.Fatalf("%d bytes, want the fade written out to a block boundary", len(b))
@@ -318,5 +321,50 @@ func TestRampNext(t *testing.T) {
 	}
 	if c, _, n := run(-100, false, -120, false); c != -120 || n != 1 {
 		t.Fatalf("both below floor: %v in %d steps", c, n)
+	}
+}
+
+// The writer thread writes the blocks in order, and Write does not wait for
+// the device (it only hands blocks over).
+func TestShelbyWriterOrder(t *testing.T) {
+	t.Setenv("SENDSPIN_SHELBY_MODE", "passthrough")
+	t.Setenv("SENDSPIN_SHELBY_MAX_DB", "0")
+	t.Setenv("SENDSPIN_SHELBY_RT_PRIO", "0")
+	s, dev := newTestShelby(t)
+	s.Open(48000, 2, 24)
+	const blocks = 10
+	in := make([]int32, 2*shelbyFrames*blocks)
+	for i := range in {
+		in[i] = int32(i / (2 * shelbyFrames)) // block number
+	}
+	if err := s.Write(in); err != nil {
+		t.Fatal(err)
+	}
+	s.drain()
+	b, _ := os.ReadFile(dev)
+	if len(b) != blocks*shelbyBlockBytes {
+		t.Fatalf("%d bytes, want %d blocks", len(b), blocks)
+	}
+	for k := 0; k < blocks; k++ {
+		if l, _ := frameAt(b, k*shelbyFrames); l != int32(k) {
+			t.Fatalf("block %d starts with %d", k, l)
+		}
+	}
+	s.Close()
+}
+
+// A failing device write surfaces as an error from Write instead of the
+// writer retrying at real-time priority.
+func TestShelbyWriterErrorSurfaces(t *testing.T) {
+	t.Setenv("SENDSPIN_SHELBY_MODE", "passthrough")
+	t.Setenv("SENDSPIN_SHELBY_RT_PRIO", "0")
+	s, _ := newTestShelby(t)
+	s.Open(48000, 2, 24)
+	s.f.Close() // every write now fails
+	in := make([]int32, 2*shelbyFrames)
+	s.Write(in)
+	s.drain()
+	if err := s.Write(in); err == nil {
+		t.Fatal("no error after a failed device write")
 	}
 }

@@ -112,6 +112,14 @@ Logs on the stick, readable on any computer: `native/log.txt` (boot), `native/wp
   **exactly 4096 bytes** (512 frames). The driver copies each write into a DMA buffer without a
   length check. It must be opened **`O_RDWR`**: a write-only open runs the driver's TX reset path,
   after which DMA stays stopped until the next reboot. The hardware clock paces the writes.
+- **No queue in the driver.** It has just two DMA buffers (ping/pong). `write()` waits for the next
+  buffer-done interrupt and fills the buffer that is not playing. If no write arrives before the
+  following interrupt, the driver counts `txUnderflows` and plays silence, an audible click. So every
+  block has to arrive within one block period (10.9 ms). The backend writes from a native C thread at
+  real-time priority (`SCHED_FIFO` 20, `SENDSPIN_SHELBY_RT_PRIO`), fed by a small block ring. It runs
+  outside the Go runtime on purpose: a Go thread has to get a scheduler slot back after every write,
+  and on this single-core CPU that was measured to take up to 1.9 s (garbage collection). Once a minute it logs
+  `snd_shelby: dma stats ...` (underflows, writer starvation, ring fill).
 - **Sample rate.** That clock is **not 48 kHz**: the DMA completes about 91.6 buffers/s, about
   46.9 kHz (12 MHz / 256 = 46,875 Hz fits). Fed 48 kHz, playback falls behind ~22 ms per second and
   sendspin-go drops a late chunk about once a second, which you hear as a click. The backend measures
